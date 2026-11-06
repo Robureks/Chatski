@@ -6155,13 +6155,17 @@ socket.on("message", function(data) {
 });
 
 /* =========================
-   GŁOSÓWKI - JEDEN CZYSTY SYSTEM
+   GŁOSÓWKI - WEB + ANDROID FALLBACK
 ========================= */
 
 let audioRecorder=null;
+let mediaRecorder=null;
+let mediaStream=null;
+let mediaChunks=[];
 let voiceRecording=false;
 let voiceStartedAt=0;
 let voiceTimerInterval=null;
+let voiceBackend='';
 const MAX_VOICE_TIME=60000;
 
 function getAudioRecorder(){
@@ -6171,7 +6175,7 @@ function getAudioRecorder(){
     audioRecorder=window.Capacitor.registerPlugin('CapacitorAudioRecorder');
     return audioRecorder;
   }catch(error){
-    console.error('Audio Recorder register error:',error);
+    console.warn('Audio Recorder plugin niedostępny:',error);
     return null;
   }
 }
@@ -6191,14 +6195,13 @@ function stopVoiceTimer(){
 function updateVoiceTimer(){
   if(!voiceRecording) return;
   const elapsed=Date.now()-voiceStartedAt;
-  voiceTimer.innerText=formatVoiceTime(Math.floor(elapsed/1000));
+  if(voiceTimer) voiceTimer.innerText=formatVoiceTime(Math.floor(elapsed/1000));
   if(elapsed>=MAX_VOICE_TIME) stopVoiceRecording();
 }
 
 function resetVoiceButton(){
   voiceRecording=false;
-  voiceBtn.classList.remove('recording');
-  voiceBtn.innerText='🎤';
+  if(voiceBtn){voiceBtn.classList.remove('recording');voiceBtn.innerText='🎤';}
   stopVoiceTimer();
 }
 
@@ -6207,16 +6210,18 @@ function notifyVoiceRecording(isRecording){
 }
 
 async function requestMicrophonePermission(){
+  // W przeglądarce i nowszym Android WebView mikrofon udostępnia getUserMedia.
+  if(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia==='function') return true;
   const recorder=getAudioRecorder();
   if(!recorder) return false;
   try{
     if(typeof recorder.checkPermissions==='function'){
       const p=await recorder.checkPermissions();
-      if(p && p.recordAudio==='granted') return true;
+      if(p && (p.recordAudio==='granted' || p.microphone==='granted')) return true;
     }
     if(typeof recorder.requestPermissions==='function'){
       const p=await recorder.requestPermissions();
-      return !!(p && p.recordAudio==='granted');
+      return !!(p && (p.recordAudio==='granted' || p.microphone==='granted'));
     }
     return true;
   }catch(error){
@@ -6225,25 +6230,60 @@ async function requestMicrophonePermission(){
   }
 }
 
+function getSupportedVoiceMime(){
+  if(typeof MediaRecorder==='undefined' || typeof MediaRecorder.isTypeSupported!=='function') return '';
+  const types=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
+  return types.find(type=>MediaRecorder.isTypeSupported(type)) || '';
+}
+
+async function startBrowserVoiceRecording(){
+  if(!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia!=='function'){
+    throw new Error('Ta przeglądarka nie udostępnia mikrofonu (wymagane HTTPS lub localhost).');
+  }
+  if(typeof MediaRecorder==='undefined') throw new Error('Nagrywanie MediaRecorder nie jest obsługiwane przez tę przeglądarkę.');
+
+  mediaStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  mediaChunks=[];
+  const mimeType=getSupportedVoiceMime();
+  mediaRecorder=mimeType ? new MediaRecorder(mediaStream,{mimeType}) : new MediaRecorder(mediaStream);
+  mediaRecorder.ondataavailable=function(event){if(event.data && event.data.size>0) mediaChunks.push(event.data);};
+  mediaRecorder.start(250);
+  voiceBackend='media';
+}
+
+async function startPluginVoiceRecording(){
+  const recorder=getAudioRecorder();
+  if(!recorder || typeof recorder.startRecording!=='function') throw new Error('Plugin nagrywania nie jest dostępny.');
+  if(typeof recorder.checkPermissions==='function' || typeof recorder.requestPermissions==='function'){
+    if(!await requestMicrophonePermission()) throw new Error('Brak zgody na dostęp do mikrofonu.');
+  }
+  await recorder.startRecording();
+  voiceBackend='plugin';
+}
+
 async function startVoiceRecording(){
   if(!inMatch || lockedAfterLeave || operationLocked || voiceRecording) return;
-  const recorder=getAudioRecorder();
-  if(!recorder){showToast('❌ Nie udało się uruchomić nagrywania.');return;}
-
   try{
-    if(!await requestMicrophonePermission()){
-      showToast('🎤 Zezwól aplikacji na dostęp do mikrofonu.');
-      return;
-    }
     clearPendingVoice();
-    await recorder.startRecording();
+    let started=false;
+    // Najpierw standardowy mechanizm webowy — działa w przeglądarce i WebView,
+    // o ile Android udzielił WebView dostępu do mikrofonu.
+    if(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia==='function' && typeof MediaRecorder!=='undefined'){
+      try{await startBrowserVoiceRecording();started=true;}
+      catch(webError){
+        console.warn('MediaRecorder start nieudany, próba pluginu:',webError);
+        if(mediaStream){mediaStream.getTracks().forEach(track=>track.stop());mediaStream=null;}
+      }
+    }
+    if(!started){await startPluginVoiceRecording();started=true;}
+    if(!started) throw new Error('Nie udało się uruchomić żadnego mechanizmu nagrywania.');
+
     voiceRecording=true;
     voiceStartedAt=Date.now();
     voiceBtn.classList.add('recording');
     voiceBtn.innerText='⏹';
     voiceTimer.classList.add('show');
     voiceTimer.innerText='00:00';
-    // Przycisk wysyłania jest całkowicie ukryty podczas nagrywania.
     setVoiceSendVisible(false,false);
     clearInterval(voiceTimerInterval);
     voiceTimerInterval=setInterval(updateVoiceTimer,250);
@@ -6253,77 +6293,78 @@ async function startVoiceRecording(){
     console.error('Audio Recorder start error:',error);
     notifyVoiceRecording(false);
     resetVoiceButton();
-    showToast('❌ '+(error && error.message ? error.message : 'Nie udało się rozpocząć nagrywania.'));
+    const message=error && error.message ? error.message : 'Nie udało się rozpocząć nagrywania.';
+    showToast('❌ '+message);
   }
 }
 
 async function stopVoiceRecording(){
   if(!voiceRecording) return;
-  const recorder=getAudioRecorder();
+  const duration=Date.now()-voiceStartedAt;
+  const backend=voiceBackend;
   voiceRecording=false;
   notifyVoiceRecording(false);
   voiceBtn.classList.remove('recording');
   voiceBtn.innerText='🎤';
   stopVoiceTimer();
   setVoiceSendVisible(false,false);
-  if(!recorder) return;
+  voiceBackend='';
 
   try{
     showToast('⏳ Przygotowuję głosówkę...');
-    const result = await recorder.stopRecording();
-
-    console.log('VOICE DEBUG result:', result);
-    console.log('VOICE DEBUG keys:', result ? Object.keys(result) : null);
-
-    let audioBlob = null;
-
-    // Obsługa wyników zwracanych jako Blob.
-    if (result instanceof Blob) {
-      audioBlob = result;
-    } else if (result?.blob instanceof Blob) {
-      audioBlob = result.blob;
-    } else if (result?.data instanceof Blob) {
-      audioBlob = result.data;
+    let audioBlob=null;
+    if(backend==='media' && mediaRecorder){
+      const recorder=mediaRecorder;
+      audioBlob=await new Promise((resolve,reject)=>{
+        recorder.onstop=()=>{
+          const type=recorder.mimeType || (mediaChunks[0] && mediaChunks[0].type) || 'audio/webm';
+          const blob=new Blob(mediaChunks,{type});
+          resolve(blob);
+        };
+        recorder.onerror=(event)=>reject(event.error || new Error('Błąd MediaRecorder.'));
+        if(recorder.state!=='inactive') recorder.stop();
+        else resolve(new Blob(mediaChunks,{type:recorder.mimeType || 'audio/webm'}));
+      });
+      mediaRecorder=null;
+      if(mediaStream){mediaStream.getTracks().forEach(track=>track.stop());mediaStream=null;}
+      mediaChunks=[];
+    }else if(backend==='plugin'){
+      const recorder=getAudioRecorder();
+      const result=await recorder.stopRecording();
+      console.log('VOICE DEBUG plugin result:',result);
+      if(result instanceof Blob) audioBlob=result;
+      else if(result?.blob instanceof Blob) audioBlob=result.blob;
+      else if(result?.data instanceof Blob) audioBlob=result.data;
+      else if(result?.base64){
+        const raw=atob(String(result.base64).replace(/^data:.*?;base64,/,''));
+        const bytes=new Uint8Array(raw.length);
+        for(let i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+        audioBlob=new Blob([bytes],{type:result.mimeType || 'audio/mp4'});
+      }else if(result?.uri){
+        let uri=result.uri;
+        if(window.Capacitor && typeof window.Capacitor.convertFileSrc==='function') uri=window.Capacitor.convertFileSrc(uri);
+        const response=await fetch(uri);
+        if(!response.ok) throw new Error('Nie można odczytać pliku nagrania: '+response.status);
+        audioBlob=await response.blob();
+      }
     }
 
-    // Na Androidzie plugin może zwrócić URI zamiast Blob.
-    if (!audioBlob && result?.uri) {
-      let audioUrl = result.uri;
-
-      if (window.Capacitor && typeof window.Capacitor.convertFileSrc === 'function') {
-        audioUrl = window.Capacitor.convertFileSrc(result.uri);
-      }
-
-      const response = await fetch(audioUrl);
-      if (!response.ok) {
-        throw new Error('Nie można odczytać pliku nagrania: ' + response.status);
-      }
-      audioBlob = await response.blob();
-    }
-
-    if (!audioBlob || audioBlob.size === 0) {
-      console.error('VOICE DEBUG: Nie znaleziono nagrania w obsługiwanym formacie.', result);
+    if(!audioBlob || audioBlob.size===0){
       clearPendingVoice();
-      showToast('❌ Nie udało się odczytać nagrania. Sprawdź Logcat.');
+      showToast('❌ Nagranie jest puste lub nie udało się go odczytać.');
       return;
     }
-
-    const mimeType = audioBlob.type || result?.mimeType || 'audio/mp4';
-    if (!audioBlob.type) {
-      audioBlob = new Blob([audioBlob], { type: mimeType });
-    }
-
-    console.log('VOICE DEBUG: Nagranie odczytane, rozmiar:', audioBlob.size);
     if(!inMatch || lockedAfterLeave || operationLocked){clearPendingVoice();return;}
-
-    const duration = Number(result?.duration) || (Date.now()-voiceStartedAt);
-    showPendingVoice(audioBlob,duration);
+    const safeDuration=Math.min(MAX_VOICE_TIME,Math.max(0,Number(duration)||0));
+    showPendingVoice(audioBlob,safeDuration);
     setVoiceSendVisible(true,true);
     showToast('🎤 Głosówka gotowa — kliknij 📤');
   }catch(error){
     console.error('Audio Recorder stop error:',error);
+    if(mediaStream){mediaStream.getTracks().forEach(track=>track.stop());mediaStream=null;}
+    mediaRecorder=null;mediaChunks=[];
     clearPendingVoice();
-    showToast('❌ Błąd podczas zapisywania głosówki.');
+    showToast('❌ Błąd podczas zapisywania głosówki: '+(error?.message || 'nieznany błąd'));
   }
 }
 
@@ -6332,12 +6373,10 @@ async function sendVoiceMessage(audioBlob,duration){
   if(audioBlob.size>5*1024*1024){showToast('❌ Głosówka jest za duża (maks. 5 MB).');return false;}
   if(!inMatch || lockedAfterLeave || operationLocked) return false;
   if(!socket || !socket.connected){showToast('❌ Brak połączenia z serwerem.');return false;}
-
   try{
     const mimeType=audioBlob.type || 'audio/webm';
     const safeDuration=Math.min(MAX_VOICE_TIME,Math.max(0,Number(duration)||0));
     socket.emit('voice-message',{audio:audioBlob,mimeType,duration:safeDuration});
-
     const localDiv=createVoicePlayer(audioBlob,mimeType,safeDuration,socket.id);
     chat.appendChild(localDiv);
     chat.scrollTop=chat.scrollHeight;
