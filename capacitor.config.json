@@ -1,0 +1,9 @@
+﻿{
+  "appId": "com.randomchat.app",
+  "appName": "Random Chat",
+  "webDir": "public",
+  "server": {
+    "url": "https://washer-neural-serves-essential.trycloudflare.com",
+    "cleartext": true
+  }
+}
