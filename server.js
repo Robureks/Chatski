@@ -100,7 +100,16 @@ app.post(
   }
 );
 
-// Pliki strony internetowej
+// ==============================================
+// STRONA GŁÓWNA CHATSKI
+// ==============================================
+
+// index.html znajduje się w głównym folderze projektu.
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
+
+// Dodatkowe pliki strony z folderu public.
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
